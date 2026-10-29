@@ -217,25 +217,8 @@ private:
 // the raw bytes so the actual format can be inspected offline (e.g. with
 // `certutil -dump opm_cert_dump.bin`).
 static PCCERT_CONTEXT ParseOpmCertificate(const BYTE* pCert, DWORD certLen) {
-    FILE* f = nullptr;
-    if (fopen_s(&f, "opm_cert_dump.bin", "wb") == 0 && f) {
-        fwrite(pCert, 1, certLen, f);
-        fclose(f);
-        printf("  (raw certificate blob also saved to opm_cert_dump.bin, %lu bytes)\n",
-               static_cast<unsigned long>(certLen));
-    }
-
-    printf("  first bytes:");
-    for (DWORD i = 0; i < (certLen < 16 ? certLen : 16); ++i) printf(" %02X", pCert[i]);
-    printf("\n");
-
     PCCERT_CONTEXT cert = CertCreateCertificateContext(X509_ASN_ENCODING, pCert, certLen);
-    if (cert) {
-        printf("  parsed as a bare X.509 certificate.\n");
-        return cert;
-    }
-    printf("  [info] not a bare X.509 certificate (0x%08lx); trying CryptQueryObject...\n",
-           static_cast<unsigned long>(HRESULT_FROM_WIN32(GetLastError())));
+    if (cert) return cert;
 
     CERT_BLOB blob{};
     blob.cbData = certLen;
@@ -248,14 +231,10 @@ static PCCERT_CONTEXT ParseOpmCertificate(const BYTE* pCert, DWORD certLen) {
         CERT_QUERY_CONTENT_FLAG_ALL, CERT_QUERY_FORMAT_FLAG_ALL,
         0, nullptr, &contentType, nullptr, &hStore, nullptr, nullptr);
     if (!ok) {
-        fprintf(stderr, "  [FAIL] CryptQueryObject also failed (0x%08lx). Inspect "
-                        "opm_cert_dump.bin (e.g. `certutil -dump opm_cert_dump.bin`) "
-                        "to find out what this actually is.\n",
+        fprintf(stderr, "  [FAIL] CryptQueryObject (0x%08lx)\n",
                 static_cast<unsigned long>(HRESULT_FROM_WIN32(GetLastError())));
         return nullptr;
     }
-    printf("  CryptQueryObject succeeded (contentType=%lu); this is a chain, so "
-           "listing every certificate in the store to pick the right one.\n", contentType);
 
     // A PKCS#7 "certs-only" blob bundles the whole chain (leaf + intermediate(s)
     // + root), not just the one certificate whose private key the driver will
@@ -269,9 +248,6 @@ static PCCERT_CONTEXT ParseOpmCertificate(const BYTE* pCert, DWORD certLen) {
     PCCERT_CONTEXT ctx = nullptr;
 
     while ((ctx = CertEnumCertificatesInStore(hStore, ctx)) != nullptr) {
-        char name[256] = {0};
-        CertGetNameStringA(ctx, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr, name, sizeof(name));
-
         BYTE usage = 0;
         BOOL haveUsage = CertGetIntendedKeyUsage(X509_ASN_ENCODING, ctx->pCertInfo,
                                                   &usage, sizeof(usage));
@@ -297,10 +273,6 @@ static PCCERT_CONTEXT ParseOpmCertificate(const BYTE* pCert, DWORD certLen) {
         if (haveUsage && (usage & CERT_KEY_AGREEMENT_KEY_USAGE))     score += 1;
         if (!haveUsage)                                       score += 1;  // unrestricted
 
-        printf("    [%d] score=%d  CA=%s  keyUsage=%s0x%02X  \"%s\"\n",
-               index, score, isCA ? "yes" : "no",
-               haveUsage ? "" : "(none) ", haveUsage ? usage : 0, name);
-
         if (g_forceCertIndex >= 0) {
             if (index == g_forceCertIndex) {
                 if (best) CertFreeCertificateContext(best);
@@ -321,14 +293,6 @@ static PCCERT_CONTEXT ParseOpmCertificate(const BYTE* pCert, DWORD certLen) {
                 index);
         return nullptr;
     }
-    if (g_forceCertIndex >= 0) {
-        printf("  -> using certificate [%d] as requested on the command line.\n",
-               g_forceCertIndex);
-    } else {
-        printf("  -> using the highest-scoring certificate (score=%d). If "
-               "FinishInitialization still fails, try the other indices above "
-               "with /cert:N\n", bestScore);
-    }
     return best;
 }
 
@@ -342,18 +306,6 @@ static BCRYPT_KEY_HANDLE ImportRsaPublicKeyFromCert(PCCERT_CONTEXT cert) {
         &hKey);
     if (!ok) Fail("CryptImportPublicKeyInfoEx2", HRESULT_FROM_WIN32(GetLastError()));
 
-    DWORD keyBits = 0, cb = sizeof(keyBits);
-    if (BCRYPT_SUCCESS(BCryptGetProperty(hKey, BCRYPT_KEY_LENGTH,
-                                          reinterpret_cast<PUCHAR>(&keyBits), sizeof(keyBits), &cb, 0))) {
-        printf("  RSA key length: %lu bits (%lu bytes)\n", keyBits, keyBits / 8);
-        if (keyBits != 2048) {
-            printf("  [info] this is NOT 2048 bits -- abEncryptedInitializationParameters "
-                   "is a fixed 256-byte field, so a different key size changes how the "
-                   "RSA-OAEP ciphertext must be placed inside it (likely right-aligned/ "
-                   "zero-padded on the left, not left-aligned). This is now the prime "
-                   "suspect if FinishInitialization keeps failing.\n");
-        }
-    }
     return hKey;
 }
 
@@ -454,15 +406,7 @@ public:
     // own fresh IOPMVideoOutput (see AcquireFreshOutput) and therefore its own
     // fresh StartInitialization/driver random number/certificate fetch.
     HRESULT TryInitialize(OPM_VIDEO_OUTPUT_SEMANTICS semantics, LPCWSTR hashAlgId,
-                          bool commandSeqFirst, bool verbose) {
-        const char* label = (semantics == OPM_VOS_COPP_SEMANTICS) ? "COPP/PKCS1" : "OPM/OAEP";
-        char detail[64];
-        if (semantics == OPM_VOS_COPP_SEMANTICS) {
-            snprintf(detail, sizeof(detail), "%s", label);
-        } else {
-            snprintf(detail, sizeof(detail), "%s(%ls)", label, hashAlgId);
-        }
-
+                          bool commandSeqFirst) {
         IOPMVideoOutput* trialVo = AcquireFreshOutput(mon_, outputIndex_, semantics);
         if (!trialVo) return E_FAIL;
 
@@ -472,11 +416,6 @@ public:
 
         HRESULT hr = trialVo->StartInitialization(&driverRandom, &pCert, &certLen);
         if (FAILED(hr)) {
-            if (verbose) {
-                printf("  trying %s, order=%s -> StartInitialization failed, hr=0x%08lx\n",
-                       detail, commandSeqFirst ? "command,status" : "status,command",
-                       static_cast<unsigned long>(hr));
-            }
             trialVo->Release();
             return hr;
         }
@@ -513,7 +452,6 @@ public:
         Bytes cipher = (semantics == OPM_VOS_COPP_SEMANTICS)
             ? RsaPkcs1Encrypt(hPub, reinterpret_cast<BYTE*>(&plain), sizeof(plain))
             : RsaOaepEncrypt(hPub, hashAlgId, reinterpret_cast<BYTE*>(&plain), sizeof(plain));
-        if (verbose) printf("  ciphertext: %zu bytes\n", cipher.size());
 
         OPM_ENCRYPTED_INITIALIZATION_PARAMETERS finishParams{};
         if (cipher.size() > sizeof(finishParams.abEncryptedInitializationParameters)) {
@@ -535,12 +473,6 @@ public:
         CertFreeCertificateContext(cert);
         BCryptDestroyKey(hPub);
 
-        if (verbose) {
-            printf("  trying %s, order=%s -> hr=0x%08lx\n",
-                   detail, commandSeqFirst ? "command,status" : "status,command",
-                   static_cast<unsigned long>(hr));
-        }
-
         if (SUCCEEDED(hr)) {
             if (vo_) vo_->Release();
             vo_ = trialVo;  // keep this one alive for SendCommand/SendStatusRequest
@@ -548,8 +480,7 @@ public:
             statusSeq_ = trialStatusSeq;
             commandSeq_ = trialCommandSeq;
             cmac_ = std::make_unique<AesCmac>(sessionKey_);
-            printf("  OPM session established (%s, order=%s).\n",
-                   detail, commandSeqFirst ? "command,status" : "status,command");
+            printf("  OPM session established.\n");
         } else {
             trialVo->Release();
         }
@@ -576,21 +507,13 @@ public:
             { OPM_VOS_COPP_SEMANTICS, nullptr,                 true  },
         };
 
-        printf("  trying %zu (semantics, hash, sequence-order) combinations against "
-               "FinishInitialization...\n", std::size(candidates));
-
         HRESULT lastHr = E_FAIL;
         for (const auto& c : candidates) {
-            lastHr = TryInitialize(c.semantics, c.hash, c.commandSeqFirst, true);
+            lastHr = TryInitialize(c.semantics, c.hash, c.commandSeqFirst);
             if (SUCCEEDED(lastHr)) return;
         }
 
-        fprintf(stderr, "[FAIL] all %zu combinations failed; last hr=0x%08lx. Both the "
-                        "OPM/OAEP path and the older COPP/plain-RSA path failed the same "
-                        "way, which points away from the OAEP hash guess and toward either "
-                        "the plaintext field order/sizes, or this driver/environment "
-                        "rejecting non-certified callers outright regardless of the crypto "
-                        "being technically well-formed.\n",
+        fprintf(stderr, "[FAIL] OPM handshake failed for all %zu combinations (last hr=0x%08lx)\n",
                 std::size(candidates), static_cast<unsigned long>(lastHr));
         exit(1);
     }
@@ -817,7 +740,6 @@ int main(int argc, char** argv) {
             watchIntervalMs = atoi(argv[i] + 10);
         } else if (_strnicmp(argv[i], "/cert:", 6) == 0) {
             g_forceCertIndex = atoi(argv[i] + 6);
-            printf("Forcing use of certificate index %d.\n", g_forceCertIndex);
         }
     }
 
@@ -850,16 +772,14 @@ int main(int argc, char** argv) {
             printf("  virtual protection level = %lu (OPM_HDCP_ON == %d), statusFlags = 0x%lx\n",
                    info.ulInformation, static_cast<int>(OPM_HDCP_ON), info.ulStatusFlags);
             if (info.ulInformation == static_cast<ULONG>(OPM_HDCP_ON)) {
-                printf("  -> driver reports HDCP ON. Check the AUX trace now.\n");
+                printf("  -> HDCP is ON.\n");
                 break;
             }
         }
 
         if (!turnOff) {
-            printf("\nHolding this OPM session open so you have time to inspect the AUX "
-                   "trace. Press Enter to turn HDCP off and exit.\n");
+            printf("\nPress Enter to turn HDCP off and exit.\n");
             if (watchMode) {
-                printf("Watchdog mode: press Enter to stop.\n");
                 RunWatchdog(session, watchIntervalMs);
             } else {
                 getchar();
