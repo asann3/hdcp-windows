@@ -13,10 +13,9 @@ DRM コンテンツを再生しなくても HDCP を ON にでき、落ちたと
 
 ## 入手・ビルド
 
-### CI の成果物を使う
+### ビルド済みの exe を使う
 
-GitHub Actions のビルド結果（x64 / x86）から `opm_hdcp_force_x64.exe` などを取得する。
-artifact のダウンロードには GitHub へのログインが必要。
+[Releases](../../releases) から `opm_hdcp_force_x64.exe`（x86 版もある）を取得する。
 
 ### 手元でビルドする
 
