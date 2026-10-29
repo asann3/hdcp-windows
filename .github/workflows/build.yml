@@ -22,9 +22,7 @@ jobs:
 
       - name: Build
         shell: cmd
-        run: >
-          cl /nologo /EHsc /W4 /Fe:opm_hdcp_force_${{ matrix.arch }}.exe opm_hdcp_force.cpp
-          /link dxva2.lib d3d9.lib bcrypt.lib crypt32.lib user32.lib ole32.lib
+        run: build.bat ${{ matrix.arch }}
 
       - uses: actions/upload-artifact@v4
         with:
