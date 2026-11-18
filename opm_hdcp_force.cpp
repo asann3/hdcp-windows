@@ -795,8 +795,8 @@ void DrawButton(const DRAWITEMSTRUCT* di) {
         border = RGB(0xC4, 0xC9, 0xD1);
         text = kText;
     }
-    const bool small = di->CtlID == IDC_RECONNECT || di->CtlID == IDC_COPY;
-    const float radius = static_cast<float>(S(small ? 6 : 8));
+    const bool isSmall = di->CtlID == IDC_RECONNECT || di->CtlID == IDC_COPY;
+    const float radius = static_cast<float>(S(isSmall ? 6 : 8));
     FillRound(dc, r, radius, fill, border);
     if (focused && enabled) {
         RECT fr = r;
@@ -812,7 +812,7 @@ void DrawButton(const DRAWITEMSTRUCT* di) {
 
     wchar_t label[64];
     GetWindowTextW(di->hwndItem, label, _countof(label));
-    HFONT f = small ? fontSmall : fontButton;
+    HFONT f = isSmall ? fontSmall : fontButton;
     if (pressed) OffsetRect(&r, 0, 1);
     DrawTextAt(dc, label, r, f, text, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     if (pressed) OffsetRect(&r, 0, -1);
