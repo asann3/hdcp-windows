@@ -434,7 +434,12 @@ public:
                         cp.omac.abOMAC);
 
         // OPM_SET_PROTECTION_LEVEL needs no additional out-of-band data.
-        return vo_->Configure(&cp, 0, nullptr);
+        HRESULT hr = vo_->Configure(&cp, 0, nullptr);
+        // Same as for status requests: the driver does not advance its
+        // expected command sequence number on a rejected request (observed:
+        // after a failed ON, the next command got 0xC026251D).
+        if (FAILED(hr)) --commandSeq_;
+        return hr;
     }
 
     // param/paramLen is optional input data some status requests need. E.g.

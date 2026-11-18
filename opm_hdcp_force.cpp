@@ -265,15 +265,27 @@ private:
                        level == OPM_HDCP_ON ? L"ON" : L"OFF",
                        static_cast<unsigned long>(o.session->HdcpType()));
             } else if (hr == kErrHdcpNotSupported) {
-                o.status.hdcpUnsupported = true;
-                OpmLog(L"出力 #%zu: HDCP 非対応 (type=0x%lx, %ls) → この出力は対象外にする", i,
+                OpmLog(L"出力 #%zu: HDCP 非対応 (type=0x%lx, %ls)", i,
                        static_cast<unsigned long>(o.session->HdcpType()), DescribeHr(hr).c_str());
+                Exclude(o, i);
             } else {
                 OpmLog(L"[エラー] 出力 #%zu: HDCP %ls 要求に失敗 (%ls)", i,
                        level == OPM_HDCP_ON ? L"ON" : L"OFF", DescribeHr(hr).c_str());
             }
         }
         return accepted;
+    }
+
+    // Marks an output that can never do HDCP as excluded and closes its OPM
+    // session. Keeping a session open (and re-handshaking it) on such an
+    // output was observed to make the HDCP-capable output's ON request fail
+    // with 0x8007001F, while the old tool, which only ever opened output #0,
+    // worked.
+    void Exclude(Output& o, size_t i) {
+        o.status.hdcpUnsupported = true;
+        o.status.ok = false;
+        o.session.reset();
+        OpmLog(L"出力 #%zu: 対象外にしてセッションを閉じた", i);
     }
 
     void Nudge(Output& o) {
@@ -341,6 +353,12 @@ private:
             if (!o.actualUnsupported)
                 hrA = o.session->TryQueryHdcp(OPM_GET_ACTUAL_PROTECTION_LEVEL, actual);
             HRESULT hrV = o.session->TryQueryHdcp(OPM_GET_VIRTUAL_PROTECTION_LEVEL, virt);
+
+            if (hrV == kErrHdcpNotSupported) {
+                OpmLog(L"出力 #%zu: HDCP 非対応 (%ls)", i, DescribeHr(hrV).c_str());
+                Exclude(o, i);
+                continue;
+            }
 
             if (FAILED(hrV)) {
                 o.status.ok = false;
@@ -432,7 +450,10 @@ private:
     void Run() {
         HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         Connect();
-        if (startOn && phase_ == Phase::Ready) HandleCommand(Cmd::On);
+        if (startOn && phase_ == Phase::Ready) {
+            Poll();  // find and close outputs without HDCP before requesting ON
+            HandleCommand(Cmd::On);
+        }
 
         for (;;) {
             std::optional<Cmd> cmd;
