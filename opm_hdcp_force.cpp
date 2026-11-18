@@ -66,6 +66,7 @@ constexpr UINT WM_APP_STATE = WM_APP + 2;        // lParam: Snapshot*
 constexpr UINT WM_APP_WORKER_DONE = WM_APP + 3;
 
 constexpr UINT_PTR TIMER_CLOSE_FALLBACK = 1;
+constexpr UINT_PTR TIMER_COPY_LABEL = 2;
 
 // ERROR_GRAPHICS_OPM_HDCP_NOT_SUPPORTED: "the video output does not support HDCP".
 constexpr HRESULT kErrHdcpNotSupported = static_cast<HRESULT>(0xC0262513L);
@@ -227,7 +228,7 @@ private:
                 o.session = std::make_unique<OpmSession>(mon, i);
                 OpmLog(L"出力 #%lu: OPM ハンドシェイク中…", i);
                 o.session->Initialize();
-                OpmLog(L"出力 #%lu: OPM セッション確立", i);
+                OpmLog(L"出力 #%lu: OPM セッション確立 (%ls)", i, o.session->Variant().c_str());
                 outs_.push_back(std::move(o));
             }
             phase_ = Phase::Ready;
@@ -260,10 +261,13 @@ private:
             HRESULT hr = o.session->TrySetHdcp(level);
             if (SUCCEEDED(hr)) {
                 ++accepted;
+                OpmLog(L"出力 #%zu: HDCP %ls 要求 OK (type=0x%lx)", i,
+                       level == OPM_HDCP_ON ? L"ON" : L"OFF",
+                       static_cast<unsigned long>(o.session->HdcpType()));
             } else if (hr == kErrHdcpNotSupported) {
                 o.status.hdcpUnsupported = true;
-                OpmLog(L"出力 #%zu: HDCP 非対応 (%ls) → この出力は対象外にする", i,
-                       DescribeHr(hr).c_str());
+                OpmLog(L"出力 #%zu: HDCP 非対応 (type=0x%lx, %ls) → この出力は対象外にする", i,
+                       static_cast<unsigned long>(o.session->HdcpType()), DescribeHr(hr).c_str());
             } else {
                 OpmLog(L"[エラー] 出力 #%zu: HDCP %ls 要求に失敗 (%ls)", i,
                        level == OPM_HDCP_ON ? L"ON" : L"OFF", DescribeHr(hr).c_str());
@@ -361,7 +365,8 @@ private:
                     }
                     try {
                         o.session->Initialize();
-                        OpmLog(L"出力 #%zu: OPM セッション再確立", i);
+                        OpmLog(L"出力 #%zu: OPM セッション再確立 (%ls)", i,
+                               o.session->Variant().c_str());
                         if (requestedOn_) o.session->TrySetHdcp(OPM_HDCP_ON);
                     } catch (const OpmError& e) {
                         OpmLog(L"[エラー] 出力 #%zu: %ls", i, DescribeError(e).c_str());
@@ -486,7 +491,7 @@ private:
 
 namespace ui {
 
-enum : int { IDC_ON = 101, IDC_OFF, IDC_WATCH, IDC_INTERVAL, IDC_LOG, IDC_RECONNECT };
+enum : int { IDC_ON = 101, IDC_OFF, IDC_WATCH, IDC_INTERVAL, IDC_LOG, IDC_RECONNECT, IDC_COPY };
 
 const int kIntervals[] = {50, 100, 200, 500, 1000};
 
@@ -509,7 +514,7 @@ constexpr Tone kToneOff{RGB(0xFF, 0xFF, 0xFF), RGB(0xD6, 0xDA, 0xE0), RGB(0x6B, 
 constexpr Tone kToneBusy{RGB(0xFF, 0xF6, 0xE3), RGB(0xF0, 0xD0, 0x8A), RGB(0xB4, 0x6B, 0x00)};
 constexpr Tone kToneError{RGB(0xFD, 0xEE, 0xEE), RGB(0xF0, 0xB4, 0xB4), RGB(0xC0, 0x2D, 0x2D)};
 
-HWND btnOn, btnOff, chkWatch, cmbInterval, edtLog, btnReconnect;
+HWND btnOn, btnOff, chkWatch, cmbInterval, edtLog, btnReconnect, btnCopy;
 HFONT fontUi, fontTitle, fontStatus, fontButton, fontSmall, fontMono;
 HBRUSH brBg, brPanel;
 UINT dpi = 96;
@@ -555,7 +560,7 @@ void CreateFonts() {
 }
 
 void ApplyFonts() {
-    for (HWND h : {btnOn, btnOff, btnReconnect}) SendMessageW(h, WM_SETFONT, (WPARAM)fontButton, TRUE);
+    for (HWND h : {btnOn, btnOff, btnReconnect, btnCopy}) SendMessageW(h, WM_SETFONT, (WPARAM)fontButton, TRUE);
     SendMessageW(chkWatch, WM_SETFONT, (WPARAM)fontUi, TRUE);
     SendMessageW(cmbInterval, WM_SETFONT, (WPARAM)fontUi, TRUE);
     SendMessageW(edtLog, WM_SETFONT, (WPARAM)fontMono, TRUE);
@@ -588,7 +593,8 @@ void Layout(HWND hwnd) {
     y += rowH + S(18);
 
     const int rbw = S(84);
-    rcLogLabel = {m, y, W - m - rbw, y + S(22)};
+    rcLogLabel = {m, y, W - m - 2 * rbw - S(8), y + S(22)};
+    MoveWindow(btnCopy, W - m - 2 * rbw - S(8), y - S(2), rbw, S(24), TRUE);
     MoveWindow(btnReconnect, W - m - rbw, y - S(2), rbw, S(24), TRUE);
     y += S(26);
 
@@ -789,7 +795,8 @@ void DrawButton(const DRAWITEMSTRUCT* di) {
         border = RGB(0xC4, 0xC9, 0xD1);
         text = kText;
     }
-    const float radius = static_cast<float>(S(di->CtlID == IDC_RECONNECT ? 6 : 8));
+    const bool small = di->CtlID == IDC_RECONNECT || di->CtlID == IDC_COPY;
+    const float radius = static_cast<float>(S(small ? 6 : 8));
     FillRound(dc, r, radius, fill, border);
     if (focused && enabled) {
         RECT fr = r;
@@ -805,7 +812,7 @@ void DrawButton(const DRAWITEMSTRUCT* di) {
 
     wchar_t label[64];
     GetWindowTextW(di->hwndItem, label, _countof(label));
-    HFONT f = di->CtlID == IDC_RECONNECT ? fontSmall : fontButton;
+    HFONT f = small ? fontSmall : fontButton;
     if (pressed) OffsetRect(&r, 0, 1);
     DrawTextAt(dc, label, r, f, text, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     if (pressed) OffsetRect(&r, 0, -1);
@@ -827,6 +834,23 @@ void AppendLog(const std::wstring& line) {
     SendMessageW(edtLog, EM_SETSEL, len, len);
     SendMessageW(edtLog, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(s.c_str()));
     SendMessageW(edtLog, EM_SCROLLCARET, 0, 0);
+}
+
+void CopyLogToClipboard(HWND owner) {
+    const int len = GetWindowTextLengthW(edtLog);
+    HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, (static_cast<SIZE_T>(len) + 1) * sizeof(wchar_t));
+    if (!mem) return;
+    auto* buf = static_cast<wchar_t*>(GlobalLock(mem));
+    GetWindowTextW(edtLog, buf, len + 1);
+    GlobalUnlock(mem);
+    if (OpenClipboard(owner)) {
+        EmptyClipboard();
+        if (SetClipboardData(CF_UNICODETEXT, mem)) mem = nullptr;  // owned by the clipboard now
+        CloseClipboard();
+    }
+    if (mem) GlobalFree(mem);
+    else SetWindowTextW(btnCopy, L"コピーしました");
+    SetTimer(owner, TIMER_COPY_LABEL, 1500, nullptr);
 }
 
 void UpdateButtons() {
@@ -858,6 +882,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         chkWatch = mk(L"BUTTON", L"自動復帰（落ちたら OFF→ON で再認証）", BS_AUTOCHECKBOX | WS_TABSTOP,
                       0, IDC_WATCH);
         cmbInterval = mk(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 0, IDC_INTERVAL);
+        btnCopy = mk(L"BUTTON", L"ログをコピー", BS_OWNERDRAW | WS_TABSTOP, 0, IDC_COPY);
         btnReconnect = mk(L"BUTTON", L"再接続", BS_OWNERDRAW | WS_TABSTOP, 0, IDC_RECONNECT);
         edtLog = mk(L"EDIT", L"",
                     ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_TABSTOP, 0, IDC_LOG);
@@ -922,7 +947,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return TRUE;
     case WM_COMMAND: {
         const int id = LOWORD(wp), code = HIWORD(wp);
-        if ((code == BN_CLICKED || code == BN_DOUBLECLICKED) && !closing) {
+        if ((code == BN_CLICKED || code == BN_DOUBLECLICKED) && id == IDC_COPY) {
+            CopyLogToClipboard(hwnd);
+        } else if ((code == BN_CLICKED || code == BN_DOUBLECLICKED) && !closing) {
             if (id == IDC_ON) {
                 worker->Post(Cmd::On);
                 EnableWindow(btnOn, FALSE);
@@ -967,6 +994,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_TIMER:
         if (wp == TIMER_CLOSE_FALLBACK) DestroyWindow(hwnd);  // worker is stuck in a driver call
+        if (wp == TIMER_COPY_LABEL) {
+            KillTimer(hwnd, TIMER_COPY_LABEL);
+            SetWindowTextW(btnCopy, L"ログをコピー");
+        }
         return 0;
     case WM_CLOSE:
         if (!closing) {

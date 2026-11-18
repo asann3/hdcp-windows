@@ -67,6 +67,9 @@ DEFINE_GUID(OPM_SET_PROTECTION_LEVEL, 0x9bb9327c, 0x4eb5, 0x4727,
 #ifndef OPM_PROTECTION_TYPE_HDCP
 #define OPM_PROTECTION_TYPE_HDCP 0x00000008
 #endif
+#ifndef OPM_PROTECTION_TYPE_COPP_COMPATIBLE_HDCP
+#define OPM_PROTECTION_TYPE_COPP_COMPATIBLE_HDCP 0x00000001
+#endif
 #endif
 
 // Defined by the application (GUI log window, console, ...).
@@ -355,6 +358,17 @@ public:
     bool IsReady() const { return vo_ != nullptr; }
     ULONG Index() const { return outputIndex_; }
 
+    // Which handshake variant succeeded, for the log.
+    const std::wstring& Variant() const { return variant_; }
+
+    // The HDCP protection type to use with this session. Under COPP semantics
+    // the driver only knows the COPP-compatible HDCP type and answers the OPM
+    // one with ERROR_GRAPHICS_OPM_HDCP_NOT_SUPPORTED.
+    ULONG HdcpType() const {
+        return semantics_ == OPM_VOS_COPP_SEMANTICS ? OPM_PROTECTION_TYPE_COPP_COMPATIBLE_HDCP
+                                                    : OPM_PROTECTION_TYPE_HDCP;
+    }
+
     // Runs the handshake, trying every known parameter combination. Throws
     // OpmError if none of them works.
     void Initialize() {
@@ -376,8 +390,17 @@ public:
 
         HRESULT lastHr = E_FAIL;
         for (const auto& c : candidates) {
+            std::wstring name = (c.semantics == OPM_VOS_COPP_SEMANTICS)
+                ? std::wstring(L"COPP")
+                : std::wstring(L"OPM/") + c.hash;
+            name += c.commandSeqFirst ? L"/command-first" : L"/status-first";
             lastHr = TryInitialize(c.semantics, c.hash, c.commandSeqFirst);
-            if (SUCCEEDED(lastHr)) return;
+            if (SUCCEEDED(lastHr)) {
+                semantics_ = c.semantics;
+                variant_ = name;
+                return;
+            }
+            OpmLog(L"  handshake %ls: 0x%08lx", name.c_str(), static_cast<unsigned long>(lastHr));
         }
         Fail(L"OPM handshake (all combinations)", lastHr);
     }
@@ -385,7 +408,7 @@ public:
     // Requests an HDCP protection level (OPM_HDCP_ON / OPM_HDCP_OFF).
     HRESULT TrySetHdcp(ULONG level) {
         OPM_SET_PROTECTION_LEVEL_PARAMETERS p{};
-        p.ulProtectionType = OPM_PROTECTION_TYPE_HDCP;
+        p.ulProtectionType = HdcpType();
         p.ulProtectionLevel = level;
         return TrySendCommand(OPM_SET_PROTECTION_LEVEL, reinterpret_cast<BYTE*>(&p), sizeof(p));
     }
@@ -393,7 +416,7 @@ public:
     // Queries OPM_GET_ACTUAL_PROTECTION_LEVEL / OPM_GET_VIRTUAL_PROTECTION_LEVEL
     // for HDCP.
     HRESULT TryQueryHdcp(REFGUID what, OPM_STANDARD_INFORMATION& out) {
-        ULONG queryType = OPM_PROTECTION_TYPE_HDCP;
+        ULONG queryType = HdcpType();
         return TrySendStatusRequest(what, out, reinterpret_cast<BYTE*>(&queryType), sizeof(queryType));
     }
 
@@ -582,6 +605,8 @@ private:
 
     HMONITOR mon_;
     ULONG outputIndex_;
+    OPM_VIDEO_OUTPUT_SEMANTICS semantics_ = OPM_VOS_OPM_SEMANTICS;
+    std::wstring variant_;
     IOPMVideoOutput* vo_ = nullptr;
     ULONG statusSeq_ = 0;
     ULONG commandSeq_ = 0;
