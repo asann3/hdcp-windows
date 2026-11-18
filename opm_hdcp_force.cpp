@@ -67,10 +67,14 @@ constexpr UINT WM_APP_WORKER_DONE = WM_APP + 3;
 
 constexpr UINT_PTR TIMER_CLOSE_FALLBACK = 1;
 
+// ERROR_GRAPHICS_OPM_HDCP_NOT_SUPPORTED: "the video output does not support HDCP".
+constexpr HRESULT kErrHdcpNotSupported = static_cast<HRESULT>(0xC0262513L);
+
 enum class Phase { Connecting, Ready, Busy, Error };
 
 struct OutputStatus {
     bool ok = false;
+    bool hdcpUnsupported = false;  // driver said this output can't do HDCP
     bool actualKnown = true;  // false if the driver rejects OPM_GET_ACTUAL_PROTECTION_LEVEL
     ULONG actual = 0;
     ULONG virt = 0;
@@ -91,6 +95,7 @@ struct Snapshot {
             return false;
         for (size_t i = 0; i < outputs.size(); ++i) {
             if (outputs[i].ok != o.outputs[i].ok || outputs[i].actualKnown != o.outputs[i].actualKnown ||
+                outputs[i].hdcpUnsupported != o.outputs[i].hdcpUnsupported ||
                 outputs[i].actual != o.outputs[i].actual ||
                 outputs[i].virt != o.outputs[i].virt)
                 return false;
@@ -243,14 +248,28 @@ private:
         }
     }
 
-    void ApplyAll(ULONG level) {
+    // Returns how many outputs accepted the request. An output whose driver
+    // says it doesn't support HDCP at all is excluded from then on (until the
+    // next reconnect): a monitor can have several OPM outputs, and one that
+    // can never do HDCP must not keep the overall state at "waiting".
+    size_t ApplyAll(ULONG level) {
+        size_t accepted = 0;
         for (size_t i = 0; i < outs_.size(); ++i) {
-            HRESULT hr = outs_[i].session->TrySetHdcp(level);
-            if (FAILED(hr)) {
+            Output& o = outs_[i];
+            if (o.status.hdcpUnsupported) continue;
+            HRESULT hr = o.session->TrySetHdcp(level);
+            if (SUCCEEDED(hr)) {
+                ++accepted;
+            } else if (hr == kErrHdcpNotSupported) {
+                o.status.hdcpUnsupported = true;
+                OpmLog(L"出力 #%zu: HDCP 非対応 (%ls) → この出力は対象外にする", i,
+                       DescribeHr(hr).c_str());
+            } else {
                 OpmLog(L"[エラー] 出力 #%zu: HDCP %ls 要求に失敗 (%ls)", i,
                        level == OPM_HDCP_ON ? L"ON" : L"OFF", DescribeHr(hr).c_str());
             }
         }
+        return accepted;
     }
 
     void Nudge(Output& o) {
@@ -266,7 +285,15 @@ private:
             Publish();
             if (outs_.empty() && !Connect()) return;
             OpmLog(L"HDCP ON を要求");
-            ApplyAll(OPM_HDCP_ON);
+            if (ApplyAll(OPM_HDCP_ON) == 0) {
+                // Nothing accepted ON: don't sit in "waiting" forever.
+                ApplyAll(OPM_HDCP_OFF);
+                requestedOn_ = false;
+                error_ = L"どの出力も HDCP ON を受け付けなかった（ログを参照）";
+                phase_ = Phase::Error;
+                OpmLog(L"[エラー] %ls", error_.c_str());
+                break;
+            }
             requestedOn_ = true;
             onSince_ = Clock::now();
             for (auto& o : outs_) {
@@ -304,6 +331,7 @@ private:
 
         for (size_t i = 0; i < outs_.size(); ++i) {
             Output& o = outs_[i];
+            if (o.status.hdcpUnsupported) continue;
             OPM_STANDARD_INFORMATION actual{}, virt{};
             HRESULT hrA = S_OK;
             if (!o.actualUnsupported)
@@ -652,12 +680,16 @@ CardView Describe() {
         return v;
     }
 
-    bool allOn = !s.outputs.empty(), anyOk = false;
+    bool allOn = true, anyOk = false;
     std::wstring detail;
     for (size_t i = 0; i < s.outputs.size(); ++i) {
         const auto& o = s.outputs[i];
         if (!detail.empty()) detail += L"   |   ";
         if (s.outputs.size() > 1) detail += L"#" + std::to_wstring(i) + L"  ";
+        if (o.hdcpUnsupported) {
+            detail += L"HDCP 非対応";
+            continue;
+        }
         if (!o.ok) {
             detail += L"状態取得失敗";
             allOn = false;
