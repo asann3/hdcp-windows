@@ -71,6 +71,7 @@ enum class Phase { Connecting, Ready, Busy, Error };
 
 struct OutputStatus {
     bool ok = false;
+    bool actualKnown = true;  // false if the driver rejects OPM_GET_ACTUAL_PROTECTION_LEVEL
     ULONG actual = 0;
     ULONG virt = 0;
 };
@@ -89,7 +90,8 @@ struct Snapshot {
             outputs.size() != o.outputs.size())
             return false;
         for (size_t i = 0; i < outputs.size(); ++i) {
-            if (outputs[i].ok != o.outputs[i].ok || outputs[i].actual != o.outputs[i].actual ||
+            if (outputs[i].ok != o.outputs[i].ok || outputs[i].actualKnown != o.outputs[i].actualKnown ||
+                outputs[i].actual != o.outputs[i].actual ||
                 outputs[i].virt != o.outputs[i].virt)
                 return false;
         }
@@ -178,6 +180,8 @@ private:
         std::optional<Clock::time_point> dropStart;
         Clock::time_point lastReinit{};
         Clock::time_point lastNudge{};
+        bool actualUnsupported = false;
+        int reinitFailures = 0;
     };
 
     // Give the driver this long after an ON request before the watchdog starts
@@ -301,12 +305,12 @@ private:
         for (size_t i = 0; i < outs_.size(); ++i) {
             Output& o = outs_[i];
             OPM_STANDARD_INFORMATION actual{}, virt{};
-            HRESULT hrA = o.session->TryQueryHdcp(OPM_GET_ACTUAL_PROTECTION_LEVEL, actual);
-            HRESULT hrV = SUCCEEDED(hrA)
-                ? o.session->TryQueryHdcp(OPM_GET_VIRTUAL_PROTECTION_LEVEL, virt)
-                : hrA;
+            HRESULT hrA = S_OK;
+            if (!o.actualUnsupported)
+                hrA = o.session->TryQueryHdcp(OPM_GET_ACTUAL_PROTECTION_LEVEL, actual);
+            HRESULT hrV = o.session->TryQueryHdcp(OPM_GET_VIRTUAL_PROTECTION_LEVEL, virt);
 
-            if (FAILED(hrA) || FAILED(hrV)) {
+            if (FAILED(hrV)) {
                 o.status.ok = false;
                 if (requestedOn_ && o.wasOn) {
                     o.wasOn = false;
@@ -314,11 +318,19 @@ private:
                     ++drops_;
                 }
                 // The video output object may have been invalidated (e.g. by a
-                // display mode change). Redo the handshake, at most once a second.
-                if (now - o.lastReinit > std::chrono::seconds(1)) {
+                // display mode change). Redo the handshake, backing off from
+                // 1 s up to 30 s while it keeps failing.
+                const auto backoff = std::chrono::seconds(1 << (std::min)(o.reinitFailures, 5));
+                if (now - o.lastReinit > backoff) {
                     o.lastReinit = now;
-                    OpmLog(L"[警告] 出力 #%zu: 状態取得に失敗 (%ls) → 再ハンドシェイク", i,
-                           DescribeHr(FAILED(hrA) ? hrA : hrV).c_str());
+                    ++o.reinitFailures;
+                    if (o.actualUnsupported) {
+                        OpmLog(L"[警告] 出力 #%zu: virtual の取得に失敗 (%ls) → 再ハンドシェイク", i,
+                               DescribeHr(hrV).c_str());
+                    } else {
+                        OpmLog(L"[警告] 出力 #%zu: 状態取得に失敗 actual=%ls / virtual=%ls → 再ハンドシェイク",
+                               i, DescribeHr(hrA).c_str(), DescribeHr(hrV).c_str());
+                    }
                     try {
                         o.session->Initialize();
                         OpmLog(L"出力 #%zu: OPM セッション再確立", i);
@@ -329,11 +341,23 @@ private:
                 }
                 continue;
             }
+            o.reinitFailures = 0;
+
+            if (FAILED(hrA)) {
+                // Some drivers reject OPM_GET_ACTUAL_PROTECTION_LEVEL while the
+                // virtual level works. Fall back to the virtual level from now on
+                // (until the next reconnect) instead of failing forever.
+                o.actualUnsupported = true;
+                OpmLog(L"[警告] 出力 #%zu: actual の取得に失敗 (%ls) → 以降は virtual で判定", i,
+                       DescribeHr(hrA).c_str());
+            }
 
             o.status.ok = true;
-            o.status.actual = actual.ulInformation;
+            o.status.actualKnown = !o.actualUnsupported;
+            o.status.actual = o.actualUnsupported ? 0 : actual.ulInformation;
             o.status.virt = virt.ulInformation;
-            const bool isOn = actual.ulInformation == static_cast<ULONG>(OPM_HDCP_ON);
+            const ULONG level = o.actualUnsupported ? virt.ulInformation : actual.ulInformation;
+            const bool isOn = level == static_cast<ULONG>(OPM_HDCP_ON);
 
             if (!requestedOn_) {
                 o.wasOn = isOn;
@@ -640,8 +664,9 @@ CardView Describe() {
             continue;
         }
         anyOk = true;
-        detail += L"actual " + LevelText(o.actual) + L"  ·  virtual " + LevelText(o.virt);
-        if (o.actual != static_cast<ULONG>(OPM_HDCP_ON)) allOn = false;
+        detail += L"actual " + (o.actualKnown ? LevelText(o.actual) : std::wstring(L"取得不可")) +
+                  L"  ·  virtual " + LevelText(o.virt);
+        if ((o.actualKnown ? o.actual : o.virt) != static_cast<ULONG>(OPM_HDCP_ON)) allOn = false;
     }
     v.line1 = detail.empty() ? L"—" : detail;
 

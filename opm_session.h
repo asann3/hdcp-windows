@@ -439,7 +439,14 @@ public:
         // polling loop.
         auto out = std::make_unique<OPM_REQUESTED_INFORMATION>();
         HRESULT hr = vo_->GetInformation(&gp, out.get());
-        if (FAILED(hr)) return hr;
+        if (FAILED(hr)) {
+            // Don't consume the sequence number on a rejected request: if the
+            // driver only advances its expected number on success, one failed
+            // query would otherwise make every later one fail with
+            // ERROR_GRAPHICS_OPM_INVALID_INFORMATION_REQUEST (bad sequence/OMAC).
+            --statusSeq_;
+            return hr;
+        }
 
         BYTE checkTag[16];
         cmac_->Compute(reinterpret_cast<BYTE*>(out.get()) + sizeof(out->omac),
