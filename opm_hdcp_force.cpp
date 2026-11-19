@@ -67,6 +67,7 @@ constexpr UINT WM_APP_WORKER_DONE = WM_APP + 3;
 
 constexpr UINT_PTR TIMER_CLOSE_FALLBACK = 1;
 constexpr UINT_PTR TIMER_COPY_LABEL = 2;
+constexpr UINT_PTR TIMER_DISPLAY_CHANGE = 3;
 
 // ERROR_GRAPHICS_OPM_HDCP_NOT_SUPPORTED: "the video output does not support HDCP".
 constexpr HRESULT kErrHdcpNotSupported = static_cast<HRESULT>(0xC0262513L);
@@ -74,6 +75,7 @@ constexpr HRESULT kErrHdcpNotSupported = static_cast<HRESULT>(0xC0262513L);
 enum class Phase { Connecting, Ready, Busy, Error };
 
 struct OutputStatus {
+    std::wstring label;  // e.g. "DISPLAY2 #0"
     bool ok = false;
     bool hdcpUnsupported = false;  // driver said this output can't do HDCP
     bool actualKnown = true;  // false if the driver rejects OPM_GET_ACTUAL_PROTECTION_LEVEL
@@ -95,7 +97,8 @@ struct Snapshot {
             outputs.size() != o.outputs.size())
             return false;
         for (size_t i = 0; i < outputs.size(); ++i) {
-            if (outputs[i].ok != o.outputs[i].ok || outputs[i].actualKnown != o.outputs[i].actualKnown ||
+            if (outputs[i].label != o.outputs[i].label || outputs[i].ok != o.outputs[i].ok ||
+                outputs[i].actualKnown != o.outputs[i].actualKnown ||
                 outputs[i].hdcpUnsupported != o.outputs[i].hdcpUnsupported ||
                 outputs[i].actual != o.outputs[i].actual ||
                 outputs[i].virt != o.outputs[i].virt)
@@ -180,6 +183,7 @@ public:
 
 private:
     struct Output {
+        std::wstring label;
         std::unique_ptr<OpmSession> session;
         OutputStatus status;
         bool wasOn = false;
@@ -213,40 +217,77 @@ private:
         if (!PostMessageW(g_hwnd, WM_APP_STATE, 0, reinterpret_cast<LPARAM>(p))) delete p;
     }
 
+    static BOOL CALLBACK CollectMonitor(HMONITOR mon, HDC, LPRECT, LPARAM lp) {
+        reinterpret_cast<std::vector<HMONITOR>*>(lp)->push_back(mon);
+        return TRUE;
+    }
+
+    static std::wstring MonitorName(HMONITOR mon) {
+        MONITORINFOEXW mi{};
+        mi.cbSize = sizeof(mi);
+        if (!GetMonitorInfoW(mon, &mi)) return L"(不明なモニタ)";
+        std::wstring name = mi.szDevice;
+        if (name.rfind(L"\\\\.\\", 0) == 0) name.erase(0, 4);  // "\\.\DISPLAY1" -> "DISPLAY1"
+        if (mi.dwFlags & MONITORINFOF_PRIMARY) name += L"(プライマリ)";
+        return name;
+    }
+
+    // Opens an OPM session on every output of every monitor. Extended desktops
+    // have one HMONITOR per display, so looking only at the primary one misses
+    // the external display entirely; in duplicate mode both panels sit behind
+    // a single HMONITOR as separate outputs.
     bool Connect() {
         outs_.clear();
         phase_ = Phase::Connecting;
         error_.clear();
         Publish();
-        try {
-            HMONITOR mon = MonitorFromWindow(GetDesktopWindow(), MONITOR_DEFAULTTOPRIMARY);
-            ULONG n = CountVideoOutputs(mon);
-            OpmLog(L"プライマリモニタの OPM 出力: %lu 個", n);
-            if (n == 0) Fail(L"OPMGetVideoOutputsFromHMONITOR (出力 0 個)", E_FAIL);
+
+        std::vector<HMONITOR> monitors;
+        EnumDisplayMonitors(nullptr, nullptr, CollectMonitor, reinterpret_cast<LPARAM>(&monitors));
+        OpmLog(L"モニタ: %zu 台", monitors.size());
+
+        OpmError lastError{L"OPMGetVideoOutputsFromHMONITOR (出力 0 個)", E_FAIL};
+        for (HMONITOR mon : monitors) {
+            const std::wstring mname = MonitorName(mon);
+            ULONG n = 0;
+            try {
+                n = CountVideoOutputs(mon);
+            } catch (const OpmError& e) {
+                lastError = e;
+                OpmLog(L"%ls: OPM 出力を取得できない (%ls)", mname.c_str(), DescribeError(e).c_str());
+                continue;
+            }
+            OpmLog(L"%ls: OPM 出力 %lu 個", mname.c_str(), n);
             for (ULONG i = 0; i < n; ++i) {
                 Output o;
+                o.label = mname + L" #" + std::to_wstring(i);
+                o.status.label = o.label;
                 o.session = std::make_unique<OpmSession>(mon, i);
-                OpmLog(L"出力 #%lu: OPM ハンドシェイク中…", i);
-                o.session->Initialize();
-                OpmLog(L"出力 #%lu: OPM セッション確立 (%ls)", i, o.session->Variant().c_str());
+                OpmLog(L"%ls: OPM ハンドシェイク中…", o.label.c_str());
+                try {
+                    o.session->Initialize();
+                } catch (const OpmError& e) {
+                    lastError = e;
+                    OpmLog(L"[エラー] %ls: %ls", o.label.c_str(), DescribeError(e).c_str());
+                    continue;
+                }
+                OpmLog(L"%ls: OPM セッション確立 (%ls)", o.label.c_str(), o.session->Variant().c_str());
                 outs_.push_back(std::move(o));
             }
-            phase_ = Phase::Ready;
-            Publish();
-            return true;
-        } catch (const OpmError& e) {
-            outs_.clear();
-            error_ = DescribeError(e);
+        }
+
+        if (outs_.empty()) {
+            error_ = DescribeError(lastError);
             phase_ = Phase::Error;
             OpmLog(L"[エラー] %ls", error_.c_str());
-            if (e.hr == E_NOTIMPL || HRESULT_FACILITY(e.hr) == 0x26 /* graphics */ ||
-                e.where.find(L"OPMGetVideoOutputsFromHMONITOR") == 0) {
-                OpmLog(L"  → この GPU / ドライバ / 接続は OPM に対応していない可能性があります。"
-                       L"仮想マシンやリモートデスクトップ、Basic Display Adapter では動作しません。");
-            }
+            OpmLog(L"  → この GPU / ドライバ / 接続は OPM に対応していない可能性があります。"
+                   L"仮想マシンやリモートデスクトップ、Basic Display Adapter では動作しません。");
             Publish();
             return false;
         }
+        phase_ = Phase::Ready;
+        Publish();
+        return true;
     }
 
     // Returns how many outputs accepted the request. An output whose driver
@@ -261,15 +302,15 @@ private:
             HRESULT hr = o.session->TrySetHdcp(level);
             if (SUCCEEDED(hr)) {
                 ++accepted;
-                OpmLog(L"出力 #%zu: HDCP %ls 要求 OK (type=0x%lx)", i,
+                OpmLog(L"%ls: HDCP %ls 要求 OK (type=0x%lx)", outs_[i].label.c_str(),
                        level == OPM_HDCP_ON ? L"ON" : L"OFF",
                        static_cast<unsigned long>(o.session->HdcpType()));
             } else if (hr == kErrHdcpNotSupported) {
-                OpmLog(L"出力 #%zu: HDCP 非対応 (type=0x%lx, %ls)", i,
+                OpmLog(L"%ls: HDCP 非対応 (type=0x%lx, %ls)", outs_[i].label.c_str(),
                        static_cast<unsigned long>(o.session->HdcpType()), DescribeHr(hr).c_str());
                 Exclude(o, i);
             } else {
-                OpmLog(L"[エラー] 出力 #%zu: HDCP %ls 要求に失敗 (%ls)", i,
+                OpmLog(L"[エラー] %ls: HDCP %ls 要求に失敗 (%ls)", outs_[i].label.c_str(),
                        level == OPM_HDCP_ON ? L"ON" : L"OFF", DescribeHr(hr).c_str());
             }
         }
@@ -285,7 +326,7 @@ private:
         o.status.hdcpUnsupported = true;
         o.status.ok = false;
         o.session.reset();
-        OpmLog(L"出力 #%zu: 対象外にしてセッションを閉じた", i);
+        OpmLog(L"%ls: 対象外にしてセッションを閉じた", outs_[i].label.c_str());
     }
 
     void Nudge(Output& o) {
@@ -355,7 +396,7 @@ private:
             HRESULT hrV = o.session->TryQueryHdcp(OPM_GET_VIRTUAL_PROTECTION_LEVEL, virt);
 
             if (hrV == kErrHdcpNotSupported) {
-                OpmLog(L"出力 #%zu: HDCP 非対応 (%ls)", i, DescribeHr(hrV).c_str());
+                OpmLog(L"%ls: HDCP 非対応 (%ls)", outs_[i].label.c_str(), DescribeHr(hrV).c_str());
                 Exclude(o, i);
                 continue;
             }
@@ -375,19 +416,19 @@ private:
                     o.lastReinit = now;
                     ++o.reinitFailures;
                     if (o.actualUnsupported) {
-                        OpmLog(L"[警告] 出力 #%zu: virtual の取得に失敗 (%ls) → 再ハンドシェイク", i,
+                        OpmLog(L"[警告] %ls: virtual の取得に失敗 (%ls) → 再ハンドシェイク", outs_[i].label.c_str(),
                                DescribeHr(hrV).c_str());
                     } else {
-                        OpmLog(L"[警告] 出力 #%zu: 状態取得に失敗 actual=%ls / virtual=%ls → 再ハンドシェイク",
-                               i, DescribeHr(hrA).c_str(), DescribeHr(hrV).c_str());
+                        OpmLog(L"[警告] %ls: 状態取得に失敗 actual=%ls / virtual=%ls → 再ハンドシェイク",
+                               outs_[i].label.c_str(), DescribeHr(hrA).c_str(), DescribeHr(hrV).c_str());
                     }
                     try {
                         o.session->Initialize();
-                        OpmLog(L"出力 #%zu: OPM セッション再確立 (%ls)", i,
+                        OpmLog(L"%ls: OPM セッション再確立 (%ls)", outs_[i].label.c_str(),
                                o.session->Variant().c_str());
                         if (requestedOn_) o.session->TrySetHdcp(OPM_HDCP_ON);
                     } catch (const OpmError& e) {
-                        OpmLog(L"[エラー] 出力 #%zu: %ls", i, DescribeError(e).c_str());
+                        OpmLog(L"[エラー] %ls: %ls", outs_[i].label.c_str(), DescribeError(e).c_str());
                     }
                 }
                 continue;
@@ -399,7 +440,7 @@ private:
                 // virtual level works. Fall back to the virtual level from now on
                 // (until the next reconnect) instead of failing forever.
                 o.actualUnsupported = true;
-                OpmLog(L"[警告] 出力 #%zu: actual の取得に失敗 (%ls) → 以降は virtual で判定", i,
+                OpmLog(L"[警告] %ls: actual の取得に失敗 (%ls) → 以降は virtual で判定", outs_[i].label.c_str(),
                        DescribeHr(hrA).c_str());
             }
 
@@ -418,7 +459,7 @@ private:
             if (o.wasOn && !isOn) {
                 ++drops_;
                 o.dropStart = now;
-                OpmLog(L"[ドロップ #%d] 出力 #%zu: actual=0x%lx virtual=0x%lx%ls", drops_, i,
+                OpmLog(L"[ドロップ #%d] %ls: actual=0x%lx virtual=0x%lx%ls", drops_, outs_[i].label.c_str(),
                        static_cast<unsigned long>(actual.ulInformation),
                        static_cast<unsigned long>(virt.ulInformation),
                        watching ? L" → OFF→ON で復帰を試行" : L"");
@@ -428,10 +469,10 @@ private:
                     double gap = std::chrono::duration<double, std::milli>(now - *o.dropStart).count();
                     downtimeMs_ += gap;
                     o.dropStart.reset();
-                    OpmLog(L"[復帰] 出力 #%zu: HDCP ON に戻った (%.1f ms)", i, gap);
+                    OpmLog(L"[復帰] %ls: HDCP ON に戻った (%.1f ms)", outs_[i].label.c_str(), gap);
                 } else {
                     double t = std::chrono::duration<double, std::milli>(now - onSince_).count();
-                    OpmLog(L"出力 #%zu: HDCP ON を確認 (要求から %.0f ms)", i, t);
+                    OpmLog(L"%ls: HDCP ON を確認 (要求から %.0f ms)", outs_[i].label.c_str(), t);
                 }
             } else if (!o.wasOn && !isOn && watching && !inGrace &&
                        now - o.lastNudge >= kNudgeBackoff) {
@@ -439,7 +480,7 @@ private:
                 // assuming the earlier attempt is still in flight.
                 if (!o.dropStart) {
                     o.dropStart = now;
-                    OpmLog(L"出力 #%zu: HDCP が ON にならない → OFF→ON を再試行", i);
+                    OpmLog(L"%ls: HDCP が ON にならない → OFF→ON を再試行", outs_[i].label.c_str());
                 }
                 Nudge(o);
             }
@@ -712,7 +753,7 @@ CardView Describe() {
     for (size_t i = 0; i < s.outputs.size(); ++i) {
         const auto& o = s.outputs[i];
         if (!detail.empty()) detail += L"   |   ";
-        if (s.outputs.size() > 1) detail += L"#" + std::to_wstring(i) + L"  ";
+        if (s.outputs.size() > 1) detail += o.label + L"  ";
         if (o.hdcpUnsupported) {
             detail += L"HDCP 非対応";
             continue;
@@ -756,7 +797,7 @@ void Paint(HWND hwnd) {
     const int m = S(16);
     // Header
     DrawTextAt(dc, L"HDCP Control", {m, S(14), rc.right - m, S(40)}, fontTitle, kText);
-    DrawTextAt(dc, L"Output Protection Manager  ·  プライマリモニタ", {m, S(40), rc.right - m, S(60)},
+    DrawTextAt(dc, L"Output Protection Manager  ·  全モニタ", {m, S(40), rc.right - m, S(60)},
                fontSmall, kSubtle);
 
     // Status card
@@ -1019,6 +1060,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             KillTimer(hwnd, TIMER_COPY_LABEL);
             SetWindowTextW(btnCopy, L"ログをコピー");
         }
+        if (wp == TIMER_DISPLAY_CHANGE) {
+            KillTimer(hwnd, TIMER_DISPLAY_CHANGE);
+            if (!closing) {
+                AppendLog(L"—— ディスプレイ構成が変わったので再接続 ——");
+                worker->Post(Cmd::Reconnect);
+            }
+        }
+        return 0;
+    case WM_DISPLAYCHANGE:
+        // Switching between extend / duplicate (or plugging a display) replaces
+        // the monitors and invalidates every OPM session. Wait for the change
+        // to settle, then reconnect (re-applies ON if it was requested).
+        SetTimer(hwnd, TIMER_DISPLAY_CHANGE, 2000, nullptr);
         return 0;
     case WM_CLOSE:
         if (!closing) {
