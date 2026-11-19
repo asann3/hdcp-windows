@@ -553,7 +553,7 @@ private:
 
 namespace ui {
 
-enum : int { IDC_ON = 101, IDC_OFF, IDC_WATCH, IDC_INTERVAL, IDC_LOG, IDC_RECONNECT, IDC_COPY };
+enum : int { IDC_ON = 101, IDC_OFF, IDC_WATCH, IDC_INTERVAL, IDC_LOG, IDC_RECONNECT, IDC_COPY, IDC_TOGGLE_LOG };
 
 const int kIntervals[] = {50, 100, 200, 500, 1000};
 
@@ -576,12 +576,14 @@ constexpr Tone kToneOff{RGB(0xFF, 0xFF, 0xFF), RGB(0xD6, 0xDA, 0xE0), RGB(0x6B, 
 constexpr Tone kToneBusy{RGB(0xFF, 0xF6, 0xE3), RGB(0xF0, 0xD0, 0x8A), RGB(0xB4, 0x6B, 0x00)};
 constexpr Tone kToneError{RGB(0xFD, 0xEE, 0xEE), RGB(0xF0, 0xB4, 0xB4), RGB(0xC0, 0x2D, 0x2D)};
 
-HWND btnOn, btnOff, chkWatch, cmbInterval, edtLog, btnReconnect, btnCopy;
+HWND btnOn, btnOff, chkWatch, cmbInterval, edtLog, btnReconnect, btnCopy, btnToggleLog;
 HFONT fontUi, fontTitle, fontStatus, fontButton, fontSmall, fontMono;
 HBRUSH brBg, brPanel;
 UINT dpi = 96;
 RECT rcCard, rcLogBox, rcOptionsLabel, rcLogLabel;
 Snapshot state;
+// Log panel visible? Hidden = "demo" view where the status card fills the window.
+bool logVisible = true;
 bool haveState = false;
 bool closing = false;
 bool workerDone = false;
@@ -622,7 +624,8 @@ void CreateFonts() {
 }
 
 void ApplyFonts() {
-    for (HWND h : {btnOn, btnOff, btnReconnect, btnCopy}) SendMessageW(h, WM_SETFONT, (WPARAM)fontButton, TRUE);
+    for (HWND h : {btnOn, btnOff, btnReconnect, btnCopy, btnToggleLog})
+        SendMessageW(h, WM_SETFONT, (WPARAM)fontButton, TRUE);
     SendMessageW(chkWatch, WM_SETFONT, (WPARAM)fontUi, TRUE);
     SendMessageW(cmbInterval, WM_SETFONT, (WPARAM)fontUi, TRUE);
     SendMessageW(edtLog, WM_SETFONT, (WPARAM)fontMono, TRUE);
@@ -636,28 +639,40 @@ void Layout(HWND hwnd) {
     const int W = rc.right, H = rc.bottom;
     const int m = S(16);
 
-    int y = S(68);
-    rcCard = {m, y, W - m, y + S(124)};
-    y = rcCard.bottom + S(14);
+    // Header: small buttons on the right.
+    const int hbw = S(92), hbh = S(28), hby = S(18);
+    MoveWindow(btnToggleLog, W - m - hbw, hby, hbw, hbh, TRUE);
+    MoveWindow(btnReconnect, W - m - 2 * hbw - S(8), hby, hbw, hbh, TRUE);
 
     const int gap = S(12);
+    const int bh = S(52);
+    const int rowH = S(26);
+    // Height of the button row + option row below the card.
+    const int controlsH = S(16) + bh + S(14) + rowH;
+
+    int y = S(68);
+    if (logVisible) {
+        rcCard = {m, y, W - m, y + S(180)};
+    } else {
+        // Demo view: the status card takes everything that is left.
+        rcCard = {m, y, W - m, (std::max)(static_cast<int>(y + S(180)), static_cast<int>(H - m - controlsH))};
+    }
+    y = rcCard.bottom + S(16);
+
     const int bw = (W - 2 * m - gap) / 2;
-    const int bh = S(46);
     MoveWindow(btnOn, m, y, bw, bh, TRUE);
     MoveWindow(btnOff, m + bw + gap, y, W - 2 * m - bw - gap, bh, TRUE);
-    y += bh + S(16);
+    y += bh + S(14);
 
-    const int rowH = S(26);
     const int comboW = S(96);
     MoveWindow(cmbInterval, W - m - comboW, y, comboW, S(200), TRUE);
     rcOptionsLabel = {W - m - comboW - S(52), y, W - m - comboW - S(8), y + rowH};
     MoveWindow(chkWatch, m, y, rcOptionsLabel.left - m - S(8), rowH, TRUE);
     y += rowH + S(18);
 
-    const int rbw = S(84);
-    rcLogLabel = {m, y, W - m - 2 * rbw - S(8), y + S(22)};
-    MoveWindow(btnCopy, W - m - 2 * rbw - S(8), y - S(2), rbw, S(24), TRUE);
-    MoveWindow(btnReconnect, W - m - rbw, y - S(2), rbw, S(24), TRUE);
+    const int rbw = S(92);
+    rcLogLabel = {m, y, W - m - rbw - S(8), y + S(22)};
+    MoveWindow(btnCopy, W - m - rbw, y - S(2), rbw, S(24), TRUE);
     y += S(26);
 
     rcLogBox = {m, y, W - m, (std::max)(static_cast<int>(y + S(60)), static_cast<int>(H - m))};
@@ -665,6 +680,17 @@ void Layout(HWND hwnd) {
     MoveWindow(edtLog, rcLogBox.left + in + S(2), rcLogBox.top + in + S(4),
                rcLogBox.right - rcLogBox.left - 2 * in - S(4),
                rcLogBox.bottom - rcLogBox.top - 2 * in - S(8), TRUE);
+
+    const int show = logVisible ? SW_SHOW : SW_HIDE;
+    ShowWindow(edtLog, show);
+    ShowWindow(btnCopy, show);
+}
+
+void SetLogVisible(HWND hwnd, bool visible) {
+    logVisible = visible;
+    SetWindowTextW(btnToggleLog, visible ? L"ログを隠す" : L"ログを表示");
+    Layout(hwnd);
+    InvalidateRect(hwnd, nullptr, FALSE);
 }
 
 gp::Color C(COLORREF c, BYTE a = 255) {
@@ -711,6 +737,29 @@ void DrawTextAt(HDC dc, const std::wstring& s, RECT r, HFONT f, COLORREF c,
     SelectObject(dc, old);
 }
 
+COLORREF Mix(COLORREF a, COLORREF b, double t) {
+    auto ch = [t](int x, int y) { return static_cast<int>(x + (y - x) * t + 0.5); };
+    return RGB(ch(GetRValue(a), GetRValue(b)), ch(GetGValue(a), GetGValue(b)), ch(GetBValue(a), GetBValue(b)));
+}
+
+HFONT MakeFontPx(int px, int weight, const wchar_t* face) {
+    LOGFONTW lf{};
+    lf.lfHeight = -px;
+    lf.lfWeight = weight;
+    lf.lfCharSet = DEFAULT_CHARSET;
+    lf.lfQuality = CLEARTYPE_QUALITY;
+    wcscpy_s(lf.lfFaceName, face);
+    return CreateFontIndirectW(&lf);
+}
+
+SIZE TextSize(HDC dc, HFONT f, const std::wstring& s) {
+    HGDIOBJ old = SelectObject(dc, f);
+    SIZE sz{};
+    GetTextExtentPoint32W(dc, s.c_str(), static_cast<int>(s.size()), &sz);
+    SelectObject(dc, old);
+    return sz;
+}
+
 std::wstring LevelText(ULONG v) {
     if (v == static_cast<ULONG>(OPM_HDCP_ON)) return L"ON";
     if (v == static_cast<ULONG>(OPM_HDCP_OFF)) return L"OFF";
@@ -719,16 +768,22 @@ std::wstring LevelText(ULONG v) {
     return b;
 }
 
+constexpr wchar_t kIconLock = 0xE72E;    // Segoe MDL2 Assets: Lock
+constexpr wchar_t kIconUnlock = 0xE785;  // Unlock
+constexpr wchar_t kIconBusy = 0xE916;    // Stopwatch
+constexpr wchar_t kIconError = 0xE7BA;   // Warning
+
 struct CardView {
     Tone tone;
+    wchar_t icon;  // Segoe MDL2 Assets glyph
     std::wstring title;
     std::wstring line1;
     std::wstring line2;
 };
 
 CardView Describe() {
-    CardView v{kToneBusy, L"接続中…", L"OPM セッションを確立しています", L""};
-    if (closing) return {kToneBusy, L"終了中…", L"HDCP を OFF にしています", L""};
+    CardView v{kToneBusy, kIconBusy, L"接続中…", L"OPM セッションを確立しています", L""};
+    if (closing) return {kToneBusy, kIconBusy, L"終了中…", L"HDCP を OFF にしています", L""};
     if (!haveState) return v;
 
     const Snapshot& s = state;
@@ -738,10 +793,10 @@ CardView Describe() {
     v.line2 = buf;
 
     if (s.phase == Phase::Error) {
-        return {kToneError, L"エラー", s.error.empty() ? L"OPM を利用できません" : s.error,
+        return {kToneError, kIconError, L"エラー", s.error.empty() ? L"OPM を利用できません" : s.error,
                 L"「再接続」で再試行できます"};
     }
-    if (s.phase == Phase::Connecting) return {kToneBusy, L"接続中…", L"OPM ハンドシェイク中", L""};
+    if (s.phase == Phase::Connecting) return {kToneBusy, kIconBusy, L"接続中…", L"OPM ハンドシェイク中", L""};
     if (s.phase == Phase::Busy) {
         v.title = L"処理中…";
         v.line1 = L"ドライバに要求を送信しています";
@@ -772,12 +827,15 @@ CardView Describe() {
 
     if (allOn && anyOk) {
         v.tone = kToneOn;
+        v.icon = kIconLock;
         v.title = s.requestedOn ? L"HDCP ON" : L"HDCP ON（他アプリの要求）";
     } else if (s.requestedOn) {
         v.tone = kToneBusy;
+        v.icon = kIconBusy;
         v.title = s.drops > 0 ? L"HDCP 低下 — 復帰待ち" : L"HDCP 認証待ち…";
     } else {
         v.tone = kToneOff;
+        v.icon = kIconUnlock;
         v.title = L"HDCP OFF";
     }
     return v;
@@ -796,33 +854,59 @@ void Paint(HWND hwnd) {
 
     const int m = S(16);
     // Header
-    DrawTextAt(dc, L"HDCP Control", {m, S(14), rc.right - m, S(40)}, fontTitle, kText);
-    DrawTextAt(dc, L"Output Protection Manager  ·  全モニタ", {m, S(40), rc.right - m, S(60)},
+    const int headerRight = rc.right - m - 2 * S(92) - S(16);
+    DrawTextAt(dc, L"HDCP Control", {m, S(14), headerRight, S(40)}, fontTitle, kText);
+    DrawTextAt(dc, L"Output Protection Manager  ·  全モニタ", {m, S(40), headerRight, S(60)},
                fontSmall, kSubtle);
 
-    // Status card
+    // Status card: solid colour, large centred icon + title, sized to the
+    // card so it stays readable from a distance in the demo view.
     CardView v = Describe();
-    FillRound(dc, rcCard, static_cast<float>(S(10)), v.tone.fill, v.tone.border);
-    const int pad = S(18);
-    const int dotR = S(7);
-    const int titleTop = rcCard.top + S(16);
-    const int titleH = S(38);
-    FillCircle(dc, rcCard.left + pad + dotR, titleTop + titleH / 2, dotR + S(4), v.tone.accent, 50);
-    FillCircle(dc, rcCard.left + pad + dotR, titleTop + titleH / 2, dotR, v.tone.accent);
-    RECT rt{rcCard.left + pad + dotR * 2 + S(14), titleTop, rcCard.right - pad, titleTop + titleH};
-    DrawTextAt(dc, v.title, rt, fontStatus, v.tone.accent,
-               DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
-    RECT r1{rcCard.left + pad, titleTop + titleH + S(10), rcCard.right - pad, titleTop + titleH + S(32)};
-    DrawTextAt(dc, v.line1, r1, fontUi, kText);
-    RECT r2{rcCard.left + pad, r1.bottom + S(2), rcCard.right - pad, r1.bottom + S(24)};
-    DrawTextAt(dc, v.line2, r2, fontSmall, kSubtle);
+    const COLORREF fill = v.tone.accent;
+    const COLORREF white = RGB(0xFF, 0xFF, 0xFF);
+    FillRound(dc, rcCard, static_cast<float>(S(14)), fill, fill);
+
+    const int cardW = rcCard.right - rcCard.left, cardH = rcCard.bottom - rcCard.top;
+    const int pad = S(20);
+    const int detailH = S(46);  // two small lines at the bottom
+    const int bigAreaH = cardH - detailH - S(12);
+    int titlePx = (std::min)(static_cast<int>(bigAreaH * 0.55), S(150));
+    HFONT fBig = nullptr, fIcon = nullptr;
+    SIZE tsz{}, isz{};
+    const std::wstring iconStr(1, v.icon);
+    for (;; titlePx = titlePx * 9 / 10) {
+        if (fBig) DeleteObject(fBig);
+        if (fIcon) DeleteObject(fIcon);
+        fBig = MakeFontPx(titlePx, FW_BOLD, L"Segoe UI");
+        fIcon = MakeFontPx(titlePx * 8 / 10, FW_NORMAL, L"Segoe MDL2 Assets");
+        tsz = TextSize(dc, fBig, v.title);
+        isz = TextSize(dc, fIcon, iconStr);
+        if (tsz.cx + isz.cx + S(16) <= cardW - 2 * pad || titlePx <= S(18)) break;
+    }
+    const int groupW = isz.cx + S(16) + tsz.cx;
+    const int gx = rcCard.left + (cardW - groupW) / 2;
+    const int midY = rcCard.top + S(6) + bigAreaH / 2;
+    RECT ri{gx, midY - isz.cy / 2, gx + isz.cx, midY + isz.cy / 2 + 1};
+    DrawTextAt(dc, iconStr, ri, fIcon, white, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    RECT rt{gx + isz.cx + S(16), midY - tsz.cy / 2, rcCard.right - pad, midY + tsz.cy / 2 + 1};
+    DrawTextAt(dc, v.title, rt, fBig, white, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+    DeleteObject(fBig);
+    DeleteObject(fIcon);
+
+    const UINT center = DT_CENTER | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX;
+    RECT r1{rcCard.left + pad, rcCard.bottom - detailH - S(6), rcCard.right - pad, rcCard.bottom - S(26)};
+    DrawTextAt(dc, v.line1, r1, fontUi, Mix(fill, white, 0.92), center);
+    RECT r2{rcCard.left + pad, rcCard.bottom - S(26), rcCard.right - pad, rcCard.bottom - S(6)};
+    DrawTextAt(dc, v.line2, r2, fontSmall, Mix(fill, white, 0.75), center);
 
     // Option row label and log header
     DrawTextAt(dc, L"間隔", rcOptionsLabel, fontUi, kSubtle,
                DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-    DrawTextAt(dc, L"ログ", rcLogLabel, fontButton, kText,
-               DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-    FillRound(dc, rcLogBox, static_cast<float>(S(8)), kPanel, kBorder);
+    if (logVisible) {
+        DrawTextAt(dc, L"ログ", rcLogLabel, fontButton, kText,
+                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        FillRound(dc, rcLogBox, static_cast<float>(S(8)), kPanel, kBorder);
+    }
 
     BitBlt(wdc, 0, 0, rc.right, rc.bottom, dc, 0, 0, SRCCOPY);
     SelectObject(dc, oldBmp);
@@ -857,7 +941,8 @@ void DrawButton(const DRAWITEMSTRUCT* di) {
         border = RGB(0xC4, 0xC9, 0xD1);
         text = kText;
     }
-    const bool isSmall = di->CtlID == IDC_RECONNECT || di->CtlID == IDC_COPY;
+    const bool isSmall = di->CtlID == IDC_RECONNECT || di->CtlID == IDC_COPY ||
+                         di->CtlID == IDC_TOGGLE_LOG;
     const float radius = static_cast<float>(S(isSmall ? 6 : 8));
     FillRound(dc, r, radius, fill, border);
     if (focused && enabled) {
@@ -946,6 +1031,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         cmbInterval = mk(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 0, IDC_INTERVAL);
         btnCopy = mk(L"BUTTON", L"ログをコピー", BS_OWNERDRAW | WS_TABSTOP, 0, IDC_COPY);
         btnReconnect = mk(L"BUTTON", L"再接続", BS_OWNERDRAW | WS_TABSTOP, 0, IDC_RECONNECT);
+        btnToggleLog = mk(L"BUTTON", logVisible ? L"ログを隠す" : L"ログを表示",
+                          BS_OWNERDRAW | WS_TABSTOP, 0, IDC_TOGGLE_LOG);
         edtLog = mk(L"EDIT", L"",
                     ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_TABSTOP, 0, IDC_LOG);
 
@@ -974,7 +1061,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_GETMINMAXINFO: {
         auto* mmi = reinterpret_cast<MINMAXINFO*>(lp);
-        mmi->ptMinTrackSize = {S(420), S(560)};
+        mmi->ptMinTrackSize = {S(420), logVisible ? S(600) : S(400)};
         return 0;
     }
     case WM_DPICHANGED: {
@@ -1011,6 +1098,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         const int id = LOWORD(wp), code = HIWORD(wp);
         if ((code == BN_CLICKED || code == BN_DOUBLECLICKED) && id == IDC_COPY) {
             CopyLogToClipboard(hwnd);
+        } else if ((code == BN_CLICKED || code == BN_DOUBLECLICKED) && id == IDC_TOGGLE_LOG) {
+            SetLogVisible(hwnd, !logVisible);
         } else if ((code == BN_CLICKED || code == BN_DOUBLECLICKED) && !closing) {
             if (id == IDC_ON) {
                 worker->Post(Cmd::On);
@@ -1113,6 +1202,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nShow) {
     for (int i = 1; argv && i < argc; ++i) {
         if (_wcsicmp(argv[i], L"/on") == 0) worker.startOn = true;
         else if (_wcsicmp(argv[i], L"/watch") == 0) worker.watch = true;
+        else if (_wcsicmp(argv[i], L"/nolog") == 0) ui::logVisible = false;
         else if (_wcsnicmp(argv[i], L"/interval:", 10) == 0) {
             int v = _wtoi(argv[i] + 10);
             if (v >= 10) worker.intervalMs = v;
@@ -1146,7 +1236,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nShow) {
     RegisterClassExW(&wc);
 
     const UINT sysDpi = ui::QueryDpi(nullptr);
-    RECT wr{0, 0, MulDiv(460, static_cast<int>(sysDpi), 96), MulDiv(600, static_cast<int>(sysDpi), 96)};
+    RECT wr{0, 0, MulDiv(460, static_cast<int>(sysDpi), 96), MulDiv(660, static_cast<int>(sysDpi), 96)};
     const DWORD style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
     AdjustWindowRectEx(&wr, style, FALSE, 0);
     HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"HDCP Control", style, CW_USEDEFAULT,
