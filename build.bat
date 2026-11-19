@@ -23,7 +23,7 @@ call "%VSDIR%\VC\Auxiliary\Build\vcvarsall.bat" %ARCH%
 if errorlevel 1 exit /b 1
 
 :build
-cl /nologo /EHsc /W4 /Fe:opm_hdcp_force_%ARCH%.exe opm_hdcp_force.cpp /link dxva2.lib d3d9.lib bcrypt.lib crypt32.lib user32.lib ole32.lib
+cl /nologo /EHsc /W4 /utf-8 /std:c++17 /O2 /Fe:opm_hdcp_force_%ARCH%.exe opm_hdcp_force.cpp /link /SUBSYSTEM:WINDOWS dxva2.lib d3d9.lib bcrypt.lib crypt32.lib user32.lib gdi32.lib ole32.lib shell32.lib comctl32.lib gdiplus.lib
 exit /b %errorlevel%
 
 :no_vs
